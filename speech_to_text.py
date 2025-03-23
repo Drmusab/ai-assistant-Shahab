@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, Dict, Any, Union, List
+from typing import Optional, Dict, Any, Union, List, Protocol, TypeVar
 import tempfile
 from datetime import datetime
 import asyncio
@@ -10,16 +10,21 @@ import whisper
 import sounddevice as sd
 import soundfile as sf
 
-from src.speech.audio_utils import AudioProcessor
+from src.speech.audio_utils import AudioProcessor, AudioProcessingError
 from src.core.exceptions import STTError
 from src.core.config import Config
 from src.utils.logger import get_logger
 
+AudioData = TypeVar('AudioData', bound=np.ndarray)
+
+class AudioProcessorProtocol(Protocol):
+    def normalize_audio(self, audio: AudioData, target_db: float = -20.0) -> AudioData: ...
+    def trim_silence(self, audio: AudioData, threshold_db: float = -50.0) -> AudioData: ...
+    def apply_noise_reduction(self, audio: AudioData, sample_rate: int) -> AudioData: ...
 
 class WhisperTranscriber:
     """Optimized Speech recognition system using OpenAI's Whisper model."""
 
-    # Supported Whisper models and their configurations.
     AVAILABLE_MODELS = {
         "tiny": {"size": 39, "multilingual": False},
         "base": {"size": 74, "multilingual": False},
@@ -40,63 +45,45 @@ class WhisperTranscriber:
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Audio settings initialization and model loading.
+        # Audio settings initialization
         self._setup_audio_config()
-        self._load_model()
-        self.audio_processor = AudioProcessor()  # Initialize audio processor
-        self.trim_enabled = config.get("speech.preprocessing.trim_silence", True)
-        self.normalize_enabled = config.get("speech.preprocessing.normalize", True)
-        self.noise_reduction_enabled = config.get("speech.preprocessing.noise_reduction", True)
-        self.trim_threshold_db = config.get("speech.preprocessing.trim_threshold_db", -50.0)
-
-
-    def _preprocess_audio(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Apply preprocessing steps based on configuration settings.
-    
-        Args:
-            audio: Input audio data
         
-        Returns:
-            Processed audio data
-        """
-        processed_audio = audio.copy()
-
-        if self.trim_enabled:
-            processed_audio = self.audio_processor.trim_silence(
-                processed_audio,
-                threshold_db=self.trim_threshold_db
-            )
-
-        if self.normalize_enabled:
-            processed_audio = self.audio_processor.normalize_audio(processed_audio)
-
-        if self.noise_reduction_enabled:
-            processed_audio = self.audio_processor.apply_noise_reduction(
-                processed_audio,
-                self.sample_rate
-            )
-
-        return processed_audio
+        # Initialize audio processor with matching sample rate
+        self.audio_processor = AudioProcessor(sample_rate=self.sample_rate)
+        self.audio_processor.logger.handlers = self.logger.handlers
+        
+        # Load model
+        self._load_model()
+        
+        # Configure preprocessing settings
+        self._setup_preprocessing()
 
         self.logger.info(
             f"WhisperTranscriber initialized (Model: {self.model_name}, Device: {self.device})"
         )
 
+    def _setup_preprocessing(self) -> None:
+        """Configure audio preprocessing settings from config."""
+        self.trim_enabled = self.config.get("speech.preprocessing.trim_silence", True)
+        self.normalize_enabled = self.config.get("speech.preprocessing.normalize", True)
+        self.noise_reduction_enabled = self.config.get("speech.preprocessing.noise_reduction", True)
+        self.trim_threshold_db = self.config.get("speech.preprocessing.trim_threshold_db", -50.0)
+
     def _setup_audio_config(self) -> None:
         """Configure audio recording settings."""
-        self.sample_rate: int = 16000  # Whisper requires 16kHz
-        self.channels: int = 1  # Mono audio
-        self.chunk_size: int = int(self.config.get("speech.input.chunk_size", 1024))
+        self.sample_rate = self.config.get("speech.input.sample_rate", 16000)
+        self.channels = self.config.get("speech.input.channels", 1)
+        self.chunk_size = int(self.config.get("speech.input.chunk_size", 1024))
         self.audio_format = np.float32
 
-        # Create a dedicated temporary directory for audio files.
+        # Create a dedicated temporary directory for audio files
         self.temp_dir = Path(tempfile.gettempdir()) / "whisper_audio"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+
     def _load_model(self) -> None:
         """Load and initialize the Whisper model."""
         try:
-            self.model_name: str = self.config.get("speech.models.whisper.model", "base")
+            self.model_name = self.config.get("speech.models.whisper.model", "base")
             if self.model_name not in self.AVAILABLE_MODELS:
                 valid_models = ", ".join(self.AVAILABLE_MODELS.keys())
                 raise ValueError(f"Invalid model name. Available models: {valid_models}")
@@ -106,60 +93,125 @@ class WhisperTranscriber:
         except Exception as e:
             raise STTError(f"Failed to load Whisper model: {str(e)}") from e
 
+    def _preprocess_audio(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Apply preprocessing steps based on configuration settings.
+        
+        Args:
+            audio: Input audio data
+        
+        Returns:
+            Processed audio data
+            
+        Raises:
+            STTError: If audio preprocessing fails
+        """
+        try:
+            processed_audio = audio.copy()
+
+            if self.trim_enabled:
+                processed_audio = self.audio_processor.trim_silence(
+                    processed_audio,
+                    threshold_db=self.trim_threshold_db
+                )
+
+            if self.normalize_enabled:
+                processed_audio = self.audio_processor.normalize_audio(processed_audio)
+
+            if self.noise_reduction_enabled:
+                processed_audio = self.audio_processor.apply_noise_reduction(
+                    processed_audio,
+                    self.sample_rate
+                )
+
+            return processed_audio
+        except AudioProcessingError as e:
+            raise STTError(f"Audio preprocessing failed: {str(e)}") from e
+
+    def process_large_audio(self, audio: np.ndarray, chunk_size: int = 32000) -> np.ndarray:
+        """
+        Process large audio files in chunks to avoid memory issues.
+        
+        Args:
+            audio: Input audio data
+            chunk_size: Size of chunks to process
+            
+        Returns:
+            Processed audio data
+        """
+        chunks = [audio[i:i + chunk_size] for i in range(0, len(audio), chunk_size)]
+        processed_chunks = []
+        
+        for chunk in chunks:
+            processed_chunk = self._preprocess_audio(chunk)
+            processed_chunks.append(processed_chunk)
+        
+        return np.concatenate(processed_chunks)
+
     async def listen(
-    self,
-    duration: Optional[float] = None,
-    silence_threshold: float = 0.01,
-    silence_duration: float = 1.0,
-    energy_threshold: float = 0.005
-) -> np.ndarray:
-    """Record audio with voice activity detection."""
-    audio_chunks: List[np.ndarray] = []
-    is_recording = False
-    silent_chunks = 0
-    max_chunks = int((duration or float('inf')) * self.sample_rate / self.chunk_size)
+        self,
+        duration: Optional[float] = None,
+        silence_threshold: float = 0.01,
+        silence_duration: float = 1.0,
+        energy_threshold: float = 0.005
+    ) -> np.ndarray:
+        """
+        Record audio with voice activity detection.
+        
+        Args:
+            duration: Maximum recording duration in seconds
+            silence_threshold: Threshold for detecting silence
+            silence_duration: Duration of silence to stop recording
+            energy_threshold: Threshold for detecting speech
+            
+        Returns:
+            Recorded audio data
+            
+        Raises:
+            STTError: If recording fails
+        """
+        audio_chunks: List[np.ndarray] = []
+        is_recording = False
+        silent_chunks = 0
+        max_chunks = int((duration or float('inf')) * self.sample_rate / self.chunk_size)
 
-    def audio_callback(indata: np.ndarray, *_):
-        nonlocal is_recording, silent_chunks
-        energy = np.mean(np.abs(indata))
-        # Start recording when energy exceeds threshold
-        if not is_recording and energy > energy_threshold:
-            is_recording = True
-            silent_chunks = 0
+        def audio_callback(indata: np.ndarray, *_):
+            nonlocal is_recording, silent_chunks
+            energy = np.mean(np.abs(indata))
+            if not is_recording and energy > energy_threshold:
+                is_recording = True
+                silent_chunks = 0
+            if is_recording:
+                audio_chunks.append(indata.copy())
+                silent_chunks = silent_chunks + 1 if energy < silence_threshold else 0
 
-        if is_recording:
-            audio_chunks.append(indata.copy())
-            # Update silent chunk counter based on energy
-            silent_chunks = silent_chunks + 1 if energy < silence_threshold else 0
+        try:
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=self.audio_format,
+                blocksize=self.chunk_size,
+                callback=audio_callback
+            ):
+                while len(audio_chunks) < max_chunks:
+                    if is_recording and silent_chunks > int(silence_duration * self.sample_rate / self.chunk_size):
+                        break
+                    await asyncio.sleep(0.01)
 
-    try:
-        with sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=self.audio_format,
-            blocksize=self.chunk_size,
-            callback=audio_callback
-        ):
-            while len(audio_chunks) < max_chunks:
-                # Stop if recording and prolonged silence detected
-                if is_recording and silent_chunks > int(silence_duration * self.sample_rate / self.chunk_size):
-                    break
-                await asyncio.sleep(0.01)  # Yield control to the event loop
-
-        recorded_audio = np.concatenate(audio_chunks) if audio_chunks else np.array([])
-        return self._preprocess_audio(recorded_audio)
-    except Exception as e:
-        raise STTError(f"Recording failed: {str(e)}") from e
+            recorded_audio = np.concatenate(audio_chunks) if audio_chunks else np.array([])
+            return self._preprocess_audio(recorded_audio)
+        except Exception as e:
+            raise STTError(f"Recording failed: {str(e)}") from e
 
     def _write_temp_audio(self, audio: np.ndarray) -> Path:
         """
         Write audio data to a temporary WAV file.
         
         Args:
-            audio: Audio data as a numpy array.
-        
+            audio: Audio data as a numpy array
+            
         Returns:
-            Path to the temporary audio file.
+            Path to the temporary audio file
         """
         timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')
         temp_path = self.temp_dir / f"audio_{timestamp}.wav"
@@ -174,31 +226,34 @@ class WhisperTranscriber:
     ) -> Dict[str, Any]:
         """
         Transcribe audio using Whisper.
-    
+        
         Args:
-            audio: Audio data as numpy array or path to the audio file.
-            language: Language code for transcription (auto-detect if None and multilingual is enabled).
-            task: Whisper task - 'transcribe' or 'translate'.
-    
+            audio: Audio data or path to audio file
+            language: Language code for transcription
+            task: Whisper task - 'transcribe' or 'translate'
+            
         Returns:
-            Dictionary containing transcription results.
+            Dictionary containing transcription results
+            
+        Raises:
+            STTError: If transcription fails
         """
         temp_file_created = False
+        audio_path = None
+        
         try:
             if isinstance(audio, (str, Path)):
-                # Load and preprocess audio file
                 audio_data, file_sr = self.audio_processor.load_audio(audio)
                 if file_sr != self.sample_rate:
                     audio_data = self.audio_processor.resample(audio_data, file_sr, self.sample_rate)
-                audio_path = self._write_temp_audio(self._preprocess_audio(audio_data))
+                processed_audio = self.process_large_audio(audio_data)
+                audio_path = self._write_temp_audio(processed_audio)
                 temp_file_created = True
             else:
-                # Preprocess numpy array directly
-                processed_audio = self._preprocess_audio(audio)
+                processed_audio = self.process_large_audio(audio)
                 audio_path = self._write_temp_audio(processed_audio)
                 temp_file_created = True
 
-            # Prepare transcription options.
             options = whisper.DecodingOptions(
                 language=language if self.multilingual else "en",
                 task=task,
@@ -221,7 +276,7 @@ class WhisperTranscriber:
         except Exception as e:
             raise STTError(f"Transcription failed: {str(e)}") from e
         finally:
-            if temp_file_created and audio_path.exists():
+            if temp_file_created and audio_path and audio_path.exists():
                 audio_path.unlink()
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -236,12 +291,12 @@ class WhisperTranscriber:
         Batch transcribe multiple audio files.
         
         Args:
-            audio_files: List of paths to audio files.
-            language: Language code for transcription.
-            task: Whisper task - 'transcribe' or 'translate'.
-        
+            audio_files: List of paths to audio files
+            language: Language code for transcription
+            task: Whisper task - 'transcribe' or 'translate'
+            
         Returns:
-            List of transcription result dictionaries.
+            List of transcription result dictionaries
         """
         transcriptions = []
         for file in audio_files:
@@ -254,6 +309,22 @@ class WhisperTranscriber:
         Get the list of supported languages based on the current model.
         
         Returns:
-            List of supported language codes.
+            List of supported language codes
         """
         return whisper.tokenizer.LANGUAGES if self.multilingual else ["en"]
+
+    def cleanup(self) -> None:
+        """Clean up resources and temporary files."""
+        if hasattr(self, 'temp_dir') and self.temp_dir.exists():
+            for file in self.temp_dir.glob('*.wav'):
+                try:
+                    file.unlink()
+                except Exception as e:
+                    self.logger.warning(f"Failed to delete temporary file {file}: {str(e)}")
+            try:
+                self.temp_dir.rmdir()
+            except Exception as e:
+                self.logger.warning(f"Failed to remove temporary directory: {str(e)}")
+        
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
