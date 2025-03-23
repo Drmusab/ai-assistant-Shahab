@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, Tuple, Union, Dict
+from typing import Optional, Tuple, Union, Dict, Protocol, TypeVar
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -8,19 +8,35 @@ from scipy import signal
 from src.utils.logger import get_logger
 from src.core.exceptions import AudioProcessingError
 
+AudioData = TypeVar('AudioData', bound=np.ndarray)
+
+class AudioProcessorProtocol(Protocol):
+    """Protocol defining the interface for audio processing operations."""
+    def normalize_audio(self, audio: AudioData, target_db: float = -20.0) -> AudioData: ...
+    def trim_silence(self, audio: AudioData, threshold_db: float = -50.0) -> AudioData: ...
+    def apply_noise_reduction(self, audio: AudioData, sample_rate: int) -> AudioData: ...
+
 class AudioProcessor:
     """Utility class for audio processing operations."""
 
-    def __init__(self):
-        """Initialize the AudioProcessor with default settings."""
+    def __init__(self, sample_rate: int = 16000):
+        """
+        Initialize the AudioProcessor with settings.
+        
+        Args:
+            sample_rate: The default sample rate to use for processing
+        """
         self.logger = get_logger(__name__)
+        self.default_sample_rate = sample_rate
         self._set_default_params()
 
     def _set_default_params(self) -> None:
         """Set default audio processing parameters."""
-        self.default_sample_rate: int = 16000  # Standard rate for speech processing
-        self.default_channels: int = 1         # Mono audio
+        self.default_channels: int = 1  # Mono audio
         self.default_dtype = np.float32
+        self.min_silence_duration: float = 0.1
+        self.frame_length: int = 2048
+        self.hop_length: int = 512
 
     def load_audio(
         self,
@@ -36,6 +52,9 @@ class AudioProcessor:
         
         Returns:
             Tuple of (audio_data, sample_rate)
+            
+        Raises:
+            AudioProcessingError: If loading fails
         """
         try:
             file_path = Path(file_path)
@@ -48,7 +67,7 @@ class AudioProcessor:
         self,
         audio: np.ndarray,
         file_path: Union[str, Path],
-        sample_rate: int = 16000
+        sample_rate: Optional[int] = None
     ) -> Path:
         """
         Save audio data to a file.
@@ -56,14 +75,17 @@ class AudioProcessor:
         Args:
             audio: Audio data as numpy array
             file_path: Output file path
-            sample_rate: Sampling rate of the audio
+            sample_rate: Sampling rate of the audio (defaults to default_sample_rate)
         
         Returns:
             Path to the saved file
+            
+        Raises:
+            AudioProcessingError: If saving fails
         """
         try:
             file_path = Path(file_path)
-            sf.write(file_path, audio, sample_rate)
+            sf.write(file_path, audio, sample_rate or self.default_sample_rate)
             return file_path
         except Exception as e:
             raise AudioProcessingError(f"Failed to save audio file: {str(e)}") from e
@@ -84,6 +106,9 @@ class AudioProcessor:
         
         Returns:
             Resampled audio data
+            
+        Raises:
+            AudioProcessingError: If resampling fails
         """
         try:
             return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
@@ -104,6 +129,9 @@ class AudioProcessor:
         
         Returns:
             Normalized audio data
+            
+        Raises:
+            AudioProcessingError: If normalization fails
         """
         try:
             return librosa.util.normalize(audio) * (10 ** (target_db / 20.0))
@@ -126,15 +154,18 @@ class AudioProcessor:
         
         Returns:
             Noise-reduced audio data
+            
+        Raises:
+            AudioProcessingError: If noise reduction fails
         """
         try:
-            # If no noise clip provided, estimate noise from silent regions
             if noise_clip is None:
-                frame_length = int(sample_rate * 0.025)  # 25ms frames
-                hop_length = frame_length // 4
-                
-                # Estimate noise from relatively silent parts
-                S = librosa.stft(audio, n_fft=frame_length, hop_length=hop_length)
+                # Estimate noise from silent regions
+                S = librosa.stft(
+                    audio,
+                    n_fft=self.frame_length,
+                    hop_length=self.hop_length
+                )
                 mag = np.abs(S)
                 power = mag ** 2
                 noise_power = np.mean(power[:, :10], axis=1, keepdims=True)
@@ -143,9 +174,9 @@ class AudioProcessor:
                 mask = (power > noise_power).astype(np.float32)
                 S_clean = S * mask
                 
-                return librosa.istft(S_clean, hop_length=hop_length)
+                return librosa.istft(S_clean, hop_length=self.hop_length)
             else:
-                # Use provided noise profile for reduction
+                # Use provided noise profile
                 noise_power = np.mean(np.abs(librosa.stft(noise_clip)) ** 2, axis=1)
                 return self._spectral_subtraction(audio, noise_power, sample_rate)
         except Exception as e:
@@ -168,10 +199,11 @@ class AudioProcessor:
         Returns:
             Processed audio data
         """
-        frame_length = int(sample_rate * 0.025)
-        hop_length = frame_length // 4
-        
-        S = librosa.stft(audio, n_fft=frame_length, hop_length=hop_length)
+        S = librosa.stft(
+            audio,
+            n_fft=self.frame_length,
+            hop_length=self.hop_length
+        )
         mag = np.abs(S)
         phase = np.angle(S)
         
@@ -182,35 +214,13 @@ class AudioProcessor:
         
         # Reconstruct signal
         S_clean = mag_clean * np.exp(1j * phase)
-        return librosa.istft(S_clean, hop_length=hop_length)
-
-    def get_audio_info(self, file_path: Union[str, Path]) -> Dict[str, Union[int, float]]:
-        """
-        Get audio file information.
-        
-        Args:
-            file_path: Path to the audio file
-        
-        Returns:
-            Dictionary containing audio properties
-        """
-        try:
-            with sf.SoundFile(file_path) as audio_file:
-                return {
-                    "sample_rate": audio_file.samplerate,
-                    "channels": audio_file.channels,
-                    "duration": len(audio_file) / audio_file.samplerate,
-                    "format": audio_file.format,
-                    "subtype": audio_file.subtype
-                }
-        except Exception as e:
-            raise AudioProcessingError(f"Failed to get audio info: {str(e)}") from e
+        return librosa.istft(S_clean, hop_length=self.hop_length)
 
     def trim_silence(
         self,
         audio: np.ndarray,
         threshold_db: float = -50.0,
-        min_silence_duration: float = 0.1
+        min_silence_duration: Optional[float] = None
     ) -> np.ndarray:
         """
         Trim silence from the beginning and end of the audio.
@@ -222,13 +232,16 @@ class AudioProcessor:
         
         Returns:
             Trimmed audio data
+            
+        Raises:
+            AudioProcessingError: If trimming fails
         """
         try:
             return librosa.effects.trim(
                 audio,
                 top_db=-threshold_db,
-                frame_length=2048,
-                hop_length=512
+                frame_length=self.frame_length,
+                hop_length=self.hop_length
             )[0]
         except Exception as e:
             raise AudioProcessingError(f"Audio trimming failed: {str(e)}") from e
@@ -251,6 +264,9 @@ class AudioProcessor:
             
         Returns:
             List of audio segments
+            
+        Raises:
+            AudioProcessingError: If splitting fails
         """
         try:
             # Convert parameters to samples
@@ -264,10 +280,10 @@ class AudioProcessor:
             silence_starts = np.where(np.diff(silence_mask.astype(int)) == 1)[0]
             silence_ends = np.where(np.diff(silence_mask.astype(int)) == -1)[0]
             
-            # Ensure matching starts and ends
             if len(silence_starts) == 0 or len(silence_ends) == 0:
                 return [audio]
                 
+            # Ensure matching starts and ends
             if silence_starts[0] > silence_ends[0]:
                 silence_starts = np.concatenate(([0], silence_starts))
             if silence_ends[-1] < silence_starts[-1]:
@@ -282,3 +298,60 @@ class AudioProcessor:
             return segments
         except Exception as e:
             raise AudioProcessingError(f"Audio splitting failed: {str(e)}") from e
+
+    def get_audio_info(self, file_path: Union[str, Path]) -> Dict[str, Union[int, float]]:
+        """
+        Get audio file information.
+        
+        Args:
+            file_path: Path to the audio file
+        
+        Returns:
+            Dictionary containing audio properties
+            
+        Raises:
+            AudioProcessingError: If getting info fails
+        """
+        try:
+            with sf.SoundFile(file_path) as audio_file:
+                return {
+                    "sample_rate": audio_file.samplerate,
+                    "channels": audio_file.channels,
+                    "duration": len(audio_file) / audio_file.samplerate,
+                    "format": audio_file.format,
+                    "subtype": audio_file.subtype
+                }
+        except Exception as e:
+            raise AudioProcessingError(f"Failed to get audio info: {str(e)}") from e
+
+    def process_chunks(
+        self,
+        audio: np.ndarray,
+        chunk_size: int = 32000,
+        process_fn: callable = None
+    ) -> np.ndarray:
+        """
+        Process audio in chunks to handle large files.
+        
+        Args:
+            audio: Input audio data
+            chunk_size: Size of chunks to process
+            process_fn: Optional function to process each chunk
+            
+        Returns:
+            Processed audio data
+        """
+        chunks = [audio[i:i + chunk_size] for i in range(0, len(audio), chunk_size)]
+        processed_chunks = []
+        
+        for chunk in chunks:
+            if process_fn:
+                chunk = process_fn(chunk)
+            processed_chunks.append(chunk)
+        
+        return np.concatenate(processed_chunks)
+
+    def cleanup(self) -> None:
+        """Clean up any resources held by the audio processor."""
+        # Currently no cleanup needed, but method included for future use
+        pass
