@@ -16,6 +16,7 @@ class AudioProcessorProtocol(Protocol):
     def trim_silence(self, audio: AudioData, threshold_db: float = -50.0) -> AudioData: ...
     def apply_noise_reduction(self, audio: AudioData, sample_rate: int) -> AudioData: ...
 
+
 class AudioProcessor:
     """Utility class for audio processing operations."""
 
