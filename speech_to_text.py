@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, Dict, Any, Union, List, Protocol, TypeVar
+from typing import Optional, Dict, Any, Union, List
 import tempfile
 from datetime import datetime
 import asyncio
@@ -10,17 +10,16 @@ import whisper
 import sounddevice as sd
 import soundfile as sf
 
-from src.speech.audio_utils import AudioProcessor, AudioProcessingError
+# Import shared types and protocols from audio_utils instead of redefining them
+from src.speech.audio_utils import (
+    AudioProcessor,
+    AudioProcessingError,
+    AudioProcessorProtocol,
+    AudioData
+)
 from src.core.exceptions import STTError
 from src.core.config import Config
 from src.utils.logger import get_logger
-
-AudioData = TypeVar('AudioData', bound=np.ndarray)
-
-class AudioProcessorProtocol(Protocol):
-    def normalize_audio(self, audio: AudioData, target_db: float = -20.0) -> AudioData: ...
-    def trim_silence(self, audio: AudioData, threshold_db: float = -50.0) -> AudioData: ...
-    def apply_noise_reduction(self, audio: AudioData, sample_rate: int) -> AudioData: ...
 
 class WhisperTranscriber:
     """Optimized Speech recognition system using OpenAI's Whisper model."""
@@ -125,12 +124,13 @@ class WhisperTranscriber:
                 )
 
             return processed_audio
-        except AudioProcessingError as e:
+        except (AudioProcessingError, ValueError) as e:
+            # Now handling both AudioProcessingError and ValueError
             raise STTError(f"Audio preprocessing failed: {str(e)}") from e
 
     def process_large_audio(self, audio: np.ndarray, chunk_size: int = 32000) -> np.ndarray:
         """
-        Process large audio files in chunks to avoid memory issues.
+        Process large audio files in chunks using AudioProcessor's process_chunks method.
         
         Args:
             audio: Input audio data
@@ -139,14 +139,12 @@ class WhisperTranscriber:
         Returns:
             Processed audio data
         """
-        chunks = [audio[i:i + chunk_size] for i in range(0, len(audio), chunk_size)]
-        processed_chunks = []
-        
-        for chunk in chunks:
-            processed_chunk = self._preprocess_audio(chunk)
-            processed_chunks.append(processed_chunk)
-        
-        return np.concatenate(processed_chunks)
+        # Use the AudioProcessor's process_chunks method instead of implementing our own
+        return self.audio_processor.process_chunks(
+            audio,
+            chunk_size=chunk_size,
+            process_fn=self._preprocess_audio
+        )
 
     async def listen(
         self,
@@ -315,6 +313,7 @@ class WhisperTranscriber:
 
     def cleanup(self) -> None:
         """Clean up resources and temporary files."""
+        # Clean up temporary files
         if hasattr(self, 'temp_dir') and self.temp_dir.exists():
             for file in self.temp_dir.glob('*.wav'):
                 try:
@@ -326,5 +325,10 @@ class WhisperTranscriber:
             except Exception as e:
                 self.logger.warning(f"Failed to remove temporary directory: {str(e)}")
         
+        # Call the audio processor's cleanup method
+        if hasattr(self, 'audio_processor'):
+            self.audio_processor.cleanup()
+        
+        # Clear CUDA cache if using GPU
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
