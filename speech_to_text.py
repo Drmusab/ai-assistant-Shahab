@@ -1,3 +1,9 @@
+"""
+Speech to Text Transcription Module using Whisper
+Author: Drmusab
+Last Modified: 2025-03-24 00:35:12 UTC
+"""
+
 from pathlib import Path
 from typing import Optional, Dict, Any, Union, List
 import tempfile
@@ -10,12 +16,11 @@ import whisper
 import sounddevice as sd
 import soundfile as sf
 
-# Import shared types and protocols from audio_utils instead of redefining them
 from src.speech.audio_utils import (
     AudioProcessor,
     AudioProcessingError,
-    AudioProcessorProtocol,
-    AudioData
+    AudioProcessorProtocol,  # Import instead of redefining
+    AudioData  # Import instead of redefining
 )
 from src.core.exceptions import STTError
 from src.core.config import Config
@@ -49,7 +54,7 @@ class WhisperTranscriber:
         
         # Initialize audio processor with matching sample rate
         self.audio_processor = AudioProcessor(sample_rate=self.sample_rate)
-        self.audio_processor.logger.handlers = self.logger.handlers
+        # Removed redundant logger handler assignment
         
         # Load model
         self._load_model()
@@ -125,7 +130,6 @@ class WhisperTranscriber:
 
             return processed_audio
         except (AudioProcessingError, ValueError) as e:
-            # Now handling both AudioProcessingError and ValueError
             raise STTError(f"Audio preprocessing failed: {str(e)}") from e
 
     def process_large_audio(self, audio: np.ndarray, chunk_size: int = 32000) -> np.ndarray:
@@ -139,7 +143,6 @@ class WhisperTranscriber:
         Returns:
             Processed audio data
         """
-        # Use the AudioProcessor's process_chunks method instead of implementing our own
         return self.audio_processor.process_chunks(
             audio,
             chunk_size=chunk_size,
@@ -241,9 +244,11 @@ class WhisperTranscriber:
         
         try:
             if isinstance(audio, (str, Path)):
-                audio_data, file_sr = self.audio_processor.load_audio(audio)
-                if file_sr != self.sample_rate:
-                    audio_data = self.audio_processor.resample(audio_data, file_sr, self.sample_rate)
+                # Pass target_sr during loading to avoid redundant resampling
+                audio_data, file_sr = self.audio_processor.load_audio(
+                    audio,
+                    target_sr=self.sample_rate
+                )
                 processed_audio = self.process_large_audio(audio_data)
                 audio_path = self._write_temp_audio(processed_audio)
                 temp_file_created = True
@@ -313,7 +318,6 @@ class WhisperTranscriber:
 
     def cleanup(self) -> None:
         """Clean up resources and temporary files."""
-        # Clean up temporary files
         if hasattr(self, 'temp_dir') and self.temp_dir.exists():
             for file in self.temp_dir.glob('*.wav'):
                 try:
@@ -329,6 +333,5 @@ class WhisperTranscriber:
         if hasattr(self, 'audio_processor'):
             self.audio_processor.cleanup()
         
-        # Clear CUDA cache if using GPU
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
